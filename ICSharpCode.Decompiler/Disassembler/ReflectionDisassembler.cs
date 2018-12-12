@@ -28,6 +28,7 @@ using System.Threading;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.IL;
 using ICSharpCode.Decompiler.DebugInfo;
+using ICSharpCode.Decompiler.Util;
 
 namespace ICSharpCode.Decompiler.Disassembler
 {
@@ -1067,6 +1068,10 @@ namespace ICSharpCode.Decompiler.Disassembler
 			{ FieldAttributes.NotSerialized, "notserialized" },
 		};
 
+		List<DataSegment> dataSegments = null;
+		PEFile dataSegmentModule = null;
+		KeyComparer<DataSegment, int> keyComparer = KeyComparer.Create<DataSegment, int>(item => item.RVA);
+
 		public void DisassembleField(PEFile module, FieldDefinitionHandle field)
 		{
 			var metadata = module.Metadata;
@@ -1091,8 +1096,20 @@ namespace ICSharpCode.Decompiler.Disassembler
 			output.Write(' ');
 			var fieldName = metadata.GetString(fieldDefinition.Name);
 			output.Write(DisassemblerHelpers.Escape(fieldName));
+			int dataSegmentIndex = -1;
 			if (fieldDefinition.HasFlag(FieldAttributes.HasFieldRVA)) {
-				output.Write(" at I_{0:x8}", fieldDefinition.GetRelativeVirtualAddress());
+				if (dataSegmentModule != module) {
+					dataSegmentModule = module;
+					dataSegments = GetDataSegments(module);
+				}
+				int rva = fieldDefinition.GetRelativeVirtualAddress();
+				dataSegmentIndex = dataSegments.BinarySearch(new DataSegment { RVA = rva }, keyComparer);
+				if (dataSegmentIndex < 0) {
+					output.Write(" at {1}_{0:x8} /*WARNING: rogue pointer!*/", rva, 'D');
+				} else {
+					var segment = dataSegments[dataSegmentIndex];
+					output.Write(" at {1}_{0:x8}", rva, segment.Prefix);
+				}
 			}
 
 			var defaultValue = fieldDefinition.GetDefaultValue();
@@ -1101,11 +1118,224 @@ namespace ICSharpCode.Decompiler.Disassembler
 				WriteConstant(metadata, metadata.GetConstant(defaultValue));
 			}
 			output.WriteLine();
+
+			if (dataSegmentIndex >= 0) {
+				output.Write(".data ");
+				var segment = dataSegments[dataSegmentIndex];
+				var header = segment.Header;
+				if (segment.Prefix == 'T')
+					output.Write("tls ");
+				else if (segment.Prefix == 'I')
+					output.Write("cil ");
+				int from = segment.RVA;
+				int to = dataSegmentIndex < dataSegments.Count - 1 ? dataSegments[dataSegmentIndex + 1].RVA : int.MaxValue;
+				int sectionEndAddress = header.VirtualAddress + header.VirtualSize;
+				int limit = 0;
+				if (to > sectionEndAddress)
+					to = sectionEndAddress;
+				if (to - from > segment.Size) {
+					to = from + segment.Size;
+				}
+				limit = to;
+				if (limit > sectionEndAddress)
+					limit = sectionEndAddress;
+				if (from > limit) {
+					output.Write("{1}_{0:x8} = int8[{2}]", segment.RVA, segment.Prefix, to - from);
+				} else {
+					output.Write("{1}_{0:x8} = bytearray ", segment.RVA, segment.Prefix);
+					output.MarkFoldStart();
+					WriteBlob(module.Reader.GetEntireImage().GetReader(header.PointerToRawData + from - header.VirtualAddress, limit - from));
+					output.MarkFoldEnd();
+				}
+				output.WriteLine();
+			}
+
 			var attributes = fieldDefinition.GetCustomAttributes();
 			if (attributes.Count > 0) {
 				output.MarkFoldStart();
-				WriteAttributes(module, fieldDefinition.GetCustomAttributes());
+				WriteAttributes(module, attributes);
 				output.MarkFoldEnd();
+			}
+		}
+
+		struct DataSegment
+		{
+			public FieldDefinitionHandle Handle;
+			public System.Reflection.PortableExecutable.SectionHeader Header;
+			public int RVA;
+			public char Prefix;
+			public int Size;
+		}
+
+		private List<DataSegment> GetDataSegments(PEFile module)
+		{
+			var list = new List<DataSegment>();
+			var sizeDecoder = module.Reader.PEHeaders.PEHeader.Magic == System.Reflection.PortableExecutable.PEMagic.PE32
+				? FieldSizeDecoder.Instance32Bit : FieldSizeDecoder.Instance64Bit;
+			foreach (var h in module.Metadata.FieldDefinitions) {
+				var field = module.Metadata.GetFieldDefinition(h);
+				int rva = field.GetRelativeVirtualAddress();
+				if (rva == 0) continue;
+				int size = field.DecodeSignature(sizeDecoder, default);
+				foreach (var section in module.Reader.PEHeaders.SectionHeaders) {
+					if (!(rva >= section.VirtualAddress && rva < section.VirtualAddress + section.VirtualSize))
+						continue;
+					if (rva + size > section.VirtualAddress + section.VirtualSize)
+						break;
+					DataSegment segment = new DataSegment();
+					segment.Handle = h;
+					segment.Header = section;
+					segment.RVA = rva;
+					switch (section.Name) {
+						case ".tls":
+							segment.Prefix = 'T';
+							break;
+						case ".text":
+							segment.Prefix = 'I';
+							break;
+						default:
+							segment.Prefix = 'D';
+							break;
+					}
+					segment.Size = size;
+					int i = 0;
+					while (i < list.Count) {
+						if (list[i].RVA >= rva)
+							break;
+						i++;
+					}
+					list.Insert(i, segment);
+				}
+			}
+
+			return list;
+		}
+
+		class FieldSizeDecoder : ISignatureTypeProvider<int, ValueTuple>
+		{
+			public static readonly FieldSizeDecoder Instance32Bit = new FieldSizeDecoder(4);
+			public static readonly FieldSizeDecoder Instance64Bit = new FieldSizeDecoder(8);
+
+			readonly int sizeOfPointer;
+
+			private FieldSizeDecoder(int sizeOfPointer)
+			{
+				this.sizeOfPointer = sizeOfPointer;
+			}
+
+			public int GetArrayType(int elementType, ArrayShape shape)
+			{
+				if (elementType == int.MaxValue)
+					return int.MaxValue;
+				if (shape.Rank == 0)
+					return int.MaxValue;
+				int elementNumber = 1;
+				foreach (var size in shape.Sizes) {
+					if (size <= 0) continue;
+					elementNumber *= size;
+				}
+				return elementType * elementNumber;
+			}
+
+			public int GetByReferenceType(int elementType) => sizeOfPointer;
+
+			public int GetFunctionPointerType(MethodSignature<int> signature) => sizeOfPointer;
+
+			public int GetGenericInstantiation(int genericType, ImmutableArray<int> typeArguments) => int.MaxValue;
+
+			public int GetGenericMethodParameter(ValueTuple genericContext, int index) => int.MaxValue;
+
+			public int GetGenericTypeParameter(ValueTuple genericContext, int index) => int.MaxValue;
+
+			public int GetModifiedType(int modifier, int unmodifiedType, bool isRequired) => unmodifiedType;
+
+			public int GetPinnedType(int elementType) => elementType;
+
+			public int GetPointerType(int elementType) => sizeOfPointer;
+
+			public int GetPrimitiveType(PrimitiveTypeCode typeCode)
+			{
+				switch (typeCode) {
+					case PrimitiveTypeCode.Boolean:
+					case PrimitiveTypeCode.Byte:
+					case PrimitiveTypeCode.SByte:
+						return 1;
+					case PrimitiveTypeCode.Char:
+					case PrimitiveTypeCode.Int16:
+					case PrimitiveTypeCode.UInt16:
+						return 2;
+					case PrimitiveTypeCode.Int32:
+					case PrimitiveTypeCode.UInt32:
+					case PrimitiveTypeCode.Single:
+						return 4;
+					case PrimitiveTypeCode.Int64:
+					case PrimitiveTypeCode.UInt64:
+					case PrimitiveTypeCode.Double:
+						return 8;
+					case PrimitiveTypeCode.IntPtr:
+					case PrimitiveTypeCode.UIntPtr:
+					case PrimitiveTypeCode.Object:
+					case PrimitiveTypeCode.String:
+						return sizeOfPointer;
+					case PrimitiveTypeCode.TypedReference:
+						return sizeOfPointer * 2;
+					case PrimitiveTypeCode.Void:
+					default:
+						return 0;
+				}
+			}
+
+			public int GetSZArrayType(int elementType) => elementType;
+
+			public int GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind)
+			{
+				var typeDef = reader.GetTypeDefinition(handle);
+				if (!typeDef.IsValueType(reader))
+					return int.MaxValue;
+				var layoutKind = typeDef.Attributes & TypeAttributes.LayoutMask;
+				var layout = typeDef.GetLayout();
+				int pack, size;
+				if (layout.IsDefault) {
+					pack = 0;
+					size = 0;
+				} else {
+					pack = layout.PackingSize;
+					size = layout.Size;
+				}
+				int totalSize = 0;
+				foreach (var h in typeDef.GetFields()) {
+					var field = reader.GetFieldDefinition(h);
+					if (field.HasFlag(FieldAttributes.Literal) || field.HasFlag(FieldAttributes.Static))
+						continue;
+					int offset = field.GetOffset();
+					var fieldSize = field.DecodeSignature(this, default);
+					if (fieldSize == int.MaxValue)
+						return fieldSize;
+					if (layoutKind == TypeAttributes.ExplicitLayout) {
+						if (offset > 0)
+							fieldSize += (int)offset;
+						if (fieldSize > totalSize)
+							totalSize = fieldSize;
+					} else {
+						if (pack > 1) {
+							int delta = totalSize % pack;
+							if (delta != 0) totalSize += pack - delta;
+						}
+						totalSize += fieldSize;
+					}
+				}
+				int v = totalSize > size ? totalSize : size;
+				return v == 0 ? 1 : v;
+			}
+
+			public int GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind)
+			{
+				return int.MaxValue;
+			}
+
+			public int GetTypeFromSpecification(MetadataReader reader, ValueTuple genericContext, TypeSpecificationHandle handle, byte rawTypeKind)
+			{
+				return int.MaxValue;
 			}
 		}
 		#endregion
