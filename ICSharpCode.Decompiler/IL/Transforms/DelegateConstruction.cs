@@ -311,7 +311,7 @@ namespace ICSharpCode.Decompiler.IL.Transforms
 			protected internal override void VisitStObj(StObj inst)
 			{
 				base.VisitStObj(inst);
-				if (!inst.Target.MatchLdFlda(out ILInstruction target, out IField field) || !MatchesTargetOrCopyLoad(target) || target.MatchLdThis())
+				if (!inst.Target.MatchLdFlda(out ILInstruction target, out IField field) || !(MatchesTargetOrCopyLoad(target) || target.MatchLdThis()))
 					return;
 				field = (IField)field.MemberDefinition;
 				ILInstruction value;
@@ -349,16 +349,15 @@ namespace ICSharpCode.Decompiler.IL.Transforms
 			protected internal override void VisitLdFlda(LdFlda inst)
 			{
 				base.VisitLdFlda(inst);
-				if (inst.Target.MatchLdThis() && inst.Field.Name == "$this"
-					&& inst.Field.MemberDefinition.ReflectionName.Contains("c__Iterator")) {
-					var variable = currentFunction.Variables.First((f) => f.Index == -1);
+				var field = (IField)inst.Field.MemberDefinition;
+				if (inst.Target.MatchLdThis() && field.Name == "$this" && field.DeclaringType.Name.Contains("c__Iterator")) {
+					var variable = currentFunction.Variables.First(f => f.Index == -1);
 					inst.ReplaceWith(new LdLoca(variable) { ILRange = inst.ILRange });
 				}
 				if (inst.Parent is LdObj || inst.Parent is StObj)
 					return;
 				if (!MatchesTargetOrCopyLoad(inst.Target))
 					return;
-				var field = (IField)inst.Field.MemberDefinition;
 				if (!initValues.TryGetValue(field, out DisplayClassVariable info)) {
 					if (!translatedDisplayClasses.Contains(field.DeclaringTypeDefinition))
 						return;
